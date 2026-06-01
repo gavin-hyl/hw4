@@ -88,12 +88,20 @@ def get_args():
     return p.parse_args()
 
 
-def load_vp_model(checkpoint: str, device) -> tuple[VPSDE, UNet]:
-    raise NotImplementedError("Fill in VPSDE and UNet loading.")
+def _load_unet(checkpoint: str, device) -> UNet:
+    model = UNet(in_channels=1, base_channels=64).to(device)
+    model.load_state_dict(torch.load(checkpoint, map_location=device))
+    model.eval()
+    return model
+
+
+def load_vp_model(checkpoint: str, device, beta_min=0.01, beta_max=5.0, T=1000) -> tuple[VPSDE, UNet]:
+    sde = VPSDE(beta_min=beta_min, beta_max=beta_max, T=T)
+    return sde, _load_unet(checkpoint, device)
 
 
 def load_rf_model(checkpoint: str, device) -> tuple[RectifiedFlow, UNet]:
-    raise NotImplementedError("Fill in RectifiedFlow and UNet loading.")
+    return RectifiedFlow(), _load_unet(checkpoint, device)
 
 
 def main():
@@ -104,21 +112,88 @@ def main():
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
 
     if args.method == "em":
-        # TODO (5.C.iii)
-        raise NotImplementedError
+        # 5.C.iii — Euler-Maruyama samples.
+        sde, model = load_vp_model(args.checkpoint, device, args.beta_min, args.beta_max, args.T)
+        samples = sde.euler_maruyama(model, shape, num_steps=args.num_steps, device=device)
+        save_grid(samples, args.out, title=f"EM ({args.num_steps} steps)")
 
     elif args.method == "pc":
-        # TODO (5.C.iv)
-        raise NotImplementedError
+        # 5.C.iv — Predictor-Corrector samples.
+        sde, model = load_vp_model(args.checkpoint, device, args.beta_min, args.beta_max, args.T)
+        samples = sde.predictor_corrector(
+            model, shape, num_steps=args.num_steps,
+            n_corrector=args.n_corrector, snr=args.snr, device=device,
+        )
+        save_grid(samples, args.out, title=f"PC ({args.num_steps} steps, {args.n_corrector} corr.)")
 
     elif args.method == "rectflow":
-        # TODO (6.B / 6.C)
-        raise NotImplementedError
+        # 6.B / 6.C — Rectified-flow Euler ODE samples.
+        flow, model = load_rf_model(args.checkpoint, device)
+        samples = flow.euler_sample(model, shape, num_steps=args.num_steps, device=device)
+        save_grid(samples, args.out, title=f"Rectified Flow ({args.num_steps} steps)")
 
     elif args.method == "all":
-        # TODO (6.D) — generate 8 fixed-seed samples from each method and
-        # arrange them in a 4×8 grid as specified in Problem 6.D.
-        raise NotImplementedError
+        # 6.D — side-by-side 4×8 grid sharing the same 8 initial-noise seeds.
+        n = 8
+        img_shape = (n, 1, 28, 28)
+        rows, titles = [], []
+
+        # Fix the shared initial noise X_0 once so every method starts identically.
+        torch.manual_seed(args.seed)
+        x0_shared = torch.randn(img_shape, device=device)
+
+        # Row 1: DDPM EM, 1000 steps.
+        sde, vp_model = load_vp_model(args.vp_checkpoint, device, args.beta_min, args.beta_max, args.T)
+        rows.append(_em_from_noise(sde, vp_model, x0_shared, num_steps=1000, device=device))
+        titles.append("DDPM EM (1000)")
+
+        # Row 2: Rectified flow, 100 steps.
+        flow, rf_model = load_rf_model(args.rf_checkpoint, device)
+        rows.append(_rf_from_noise(flow, rf_model, x0_shared, num_steps=100, device=device))
+        titles.append("Rect. Flow (100)")
+
+        # Row 3: Rectified flow, 1 step.
+        rows.append(_rf_from_noise(flow, rf_model, x0_shared, num_steps=1, device=device))
+        titles.append("Rect. Flow (1)")
+
+        # Row 4: Reflow, 1 step.
+        if args.reflow_checkpoint:
+            _, reflow_model = load_rf_model(args.reflow_checkpoint, device)
+            rows.append(_rf_from_noise(flow, reflow_model, x0_shared, num_steps=1, device=device))
+            titles.append("Reflow (1)")
+
+        grid = torch.cat(rows, dim=0)  # (4*8, 1, 28, 28), row-major
+        save_grid(grid, args.out, nrow=n, title="  |  ".join(titles))
+
+
+@torch.no_grad()
+def _em_from_noise(sde, model, x0, num_steps, device, eps=1e-3):
+    """EM reverse-SDE starting from a *given* initial noise x0 (for fixed-seed grids)."""
+    B = x0.shape[0]
+    ts = torch.linspace(1.0, eps, num_steps + 1, device=device)
+    x = x0 * sde.sigma(ts[:1])
+    x_mean = x
+    for i in range(num_steps):
+        dt = ts[i] - ts[i + 1]
+        t = torch.full((B,), ts[i], device=device)
+        beta_t = sde.beta(t).view(-1, 1, 1, 1)
+        g_t = sde.diffusion(t).view(-1, 1, 1, 1)
+        score = model(x, t)
+        x_mean = x + (0.5 * beta_t * x + beta_t * score) * dt
+        x = x_mean + g_t * torch.sqrt(dt) * torch.randn_like(x)
+    return x_mean
+
+
+@torch.no_grad()
+def _rf_from_noise(flow, model, x0, num_steps, device):
+    """Rectified-flow Euler ODE starting from a *given* initial noise x0."""
+    B = x0.shape[0]
+    x = x0.clone()
+    dt = 1.0 / num_steps
+    for i in range(num_steps):
+        t = torch.full((B,), i * dt, device=device)
+        x = x + model(x, t) * dt
+    return x
 
 
 if __name__ == "__main__":

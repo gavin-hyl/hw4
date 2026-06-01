@@ -1,1 +1,24 @@
 .DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# Datasets (downloaded automatically; keep data/README.md)
+data/*
+!data/README.md
+
+# Training / sampling outputs
+runs/
+out/
+*.npz
+wandb/
+
+# Local agent/workflow scratch
+.claude/
+
+# Compiled output (regenerate with: typst compile cs148-hw4-ghua.typ)
+# cs148-hw4-ghua.pdf

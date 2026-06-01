@@ -17,6 +17,12 @@ import torch.nn as nn
 from torch import Tensor
 
 
+def _broadcast(coef: Tensor, x: Tensor) -> Tensor:
+    """Reshape a per-sample coefficient of shape (B,) to (B, 1, 1, ...) so it
+    broadcasts against an image batch x of shape (B, C, H, W)."""
+    return coef.reshape(-1, *([1] * (x.dim() - 1)))
+
+
 class VPSDE:
     """Variance-Preserving SDE forward process and samplers.
 
@@ -51,8 +57,8 @@ class VPSDE:
 
         Reference: Eq. (32) of Song21.
         """
-        # TODO (5.A.ii)
-        raise NotImplementedError
+        # β(t) = β_min + (β_max - β_min) t  — linear interpolation, β(0)=β_min, β(1)=β_max.
+        return self.beta_min + (self.beta_max - self.beta_min) * t
 
     def c(self, t: Tensor) -> Tensor:
         """c(t) = exp(-½ ∫_0^t β(s) ds) — the signal decay factor.
@@ -68,8 +74,8 @@ class VPSDE:
 
         Reference: Eq. (33) of Song21.
         """
-        # TODO (5.A.ii)
-        raise NotImplementedError
+        integral = self.beta_min * t + 0.5 * (self.beta_max - self.beta_min) * t**2
+        return torch.exp(-0.5 * integral)
 
     def sigma(self, t: Tensor) -> Tensor:
         """σ(t) = √(1 - c(t)²) — the noise standard deviation.
@@ -80,8 +86,8 @@ class VPSDE:
         Returns:
             σ(t), same shape as t.
         """
-        # TODO (5.A.iii)
-        raise NotImplementedError
+        # Variance preserving:  c(t)² + σ(t)² = 1.  Clamp guards tiny negatives from roundoff.
+        return torch.sqrt(torch.clamp(1.0 - self.c(t) ** 2, min=0.0))
 
     def drift(self, x: Tensor, t: Tensor) -> Tensor:
         """Drift coefficient  f(x, t) = -½ β(t) x.
@@ -93,8 +99,7 @@ class VPSDE:
         Returns:
             Drift f(x, t), same shape as x.
         """
-        # TODO (5.A.i)
-        raise NotImplementedError
+        return -0.5 * _broadcast(self.beta(t), x) * x
 
     def diffusion(self, t: Tensor) -> Tensor:
         """Diffusion coefficient  g(t) = √β(t).
@@ -105,8 +110,7 @@ class VPSDE:
         Returns:
             g(t), same shape as t.
         """
-        # TODO (5.A.i)
-        raise NotImplementedError
+        return torch.sqrt(self.beta(t))
 
     def marginal(self, x0: Tensor, t: Tensor) -> tuple[Tensor, Tensor]:
         """Sample from the forward marginal  q(x_t | x_0).
@@ -121,8 +125,11 @@ class VPSDE:
         Returns:
             (x_t, eps): noised sample and the noise used, both shape (B, *).
         """
-        # TODO (5.A.iii)
-        raise NotImplementedError
+        eps = torch.randn_like(x0)
+        c_t = _broadcast(self.c(t), x0)
+        sigma_t = _broadcast(self.sigma(t), x0)
+        x_t = c_t * x0 + sigma_t * eps
+        return x_t, eps
 
     # ------------------------------------------------------------------
     # 5.B  Samplers
@@ -135,6 +142,7 @@ class VPSDE:
         shape: tuple[int, ...],
         num_steps: int | None = None,
         device: str | torch.device = "cpu",
+        eps: float = 1e-3,
     ) -> Tensor:
         """Euler-Maruyama reverse-SDE sampler (Problem 5.B.i).
 
@@ -153,10 +161,28 @@ class VPSDE:
             Generated samples, shape (B, C, H, W), values in [-1, 1].
         """
         num_steps = num_steps or self.T
-        # TODO (5.B.i) — implement the EM sampler
-        # Hint: time runs from t=1 down to t≈0 in steps of Δt = 1/num_steps.
-        #       At t=1, initialise x ~ N(0, σ(1)² I).
-        raise NotImplementedError
+        B = shape[0]
+
+        # Time grid: t = 1 → eps in num_steps intervals.
+        ts = torch.linspace(1.0, eps, num_steps + 1, device=device)
+
+        # Initialise at t=1:  x ~ N(0, σ(1)² I).
+        x = torch.randn(shape, device=device) * self.sigma(ts[:1])
+        x_mean = x
+        for i in range(num_steps):
+            dt = ts[i] - ts[i + 1]                       # positive step size
+            t = torch.full((B,), ts[i], device=device)
+            beta_t = _broadcast(self.beta(t), x)
+            g_t = _broadcast(self.diffusion(t), x)
+            score = score_model(x, t)
+
+            # Reverse-SDE drift, integrated backward in time (subtract f, add g²·score):
+            #   x_{t-Δt} = x_t + [½ β x + β s_θ] Δt + √β · √Δt · z
+            x_mean = x + (0.5 * beta_t * x + beta_t * score) * dt
+            x = x_mean + g_t * torch.sqrt(dt) * torch.randn_like(x)
+
+        # Final step: return the mean (no injected noise) for a cleaner sample.
+        return x_mean
 
     @torch.no_grad()
     def predictor_corrector(
@@ -167,6 +193,7 @@ class VPSDE:
         n_corrector: int = 1,
         snr: float = 0.16,
         device: str | torch.device = "cpu",
+        eps: float = 1e-3,
     ) -> Tensor:
         """Predictor-Corrector sampler with EM predictor (Problem 5.B.ii).
 
@@ -185,8 +212,33 @@ class VPSDE:
             Generated samples, shape (B, C, H, W), values in [-1, 1].
         """
         num_steps = num_steps or self.T
-        # TODO (5.B.ii)
-        raise NotImplementedError
+        B = shape[0]
+
+        ts = torch.linspace(1.0, eps, num_steps + 1, device=device)
+        x = torch.randn(shape, device=device) * self.sigma(ts[:1])
+        x_mean = x
+        for i in range(num_steps):
+            t = torch.full((B,), ts[i], device=device)
+
+            # ---- Corrector: n_corrector Langevin steps (Algorithm 5, lines 5–8) ----
+            for _ in range(n_corrector):
+                grad = score_model(x, t)
+                noise = torch.randn_like(x)
+                grad_norm = grad.reshape(B, -1).norm(dim=1).mean()
+                noise_norm = noise.reshape(B, -1).norm(dim=1).mean()
+                # ε_corrector = 2 (snr · ‖z‖ / ‖score‖)²  (set so the SNR per step ≈ snr)
+                step_size = 2.0 * (snr * noise_norm / grad_norm) ** 2
+                x = x + step_size * grad + torch.sqrt(2.0 * step_size) * noise
+
+            # ---- Predictor: one Euler-Maruyama reverse-SDE step ----
+            dt = ts[i] - ts[i + 1]
+            beta_t = _broadcast(self.beta(t), x)
+            g_t = _broadcast(self.diffusion(t), x)
+            score = score_model(x, t)
+            x_mean = x + (0.5 * beta_t * x + beta_t * score) * dt
+            x = x_mean + g_t * torch.sqrt(dt) * torch.randn_like(x)
+
+        return x_mean
 
     # ------------------------------------------------------------------
     # 5.D  Inverse problems (EC)
@@ -200,6 +252,7 @@ class VPSDE:
         mask: Tensor,
         num_steps: int | None = None,
         device: str | torch.device = "cpu",
+        eps: float = 1e-3,
     ) -> Tensor:
         """Conditional reverse diffusion for inpainting (EC Problem 5.D).
 
@@ -223,5 +276,30 @@ class VPSDE:
             Reconstructed images, shape (B, C, H, W).
         """
         num_steps = num_steps or self.T
-        # TODO (EC 5.D)
-        raise NotImplementedError
+        corrupted = corrupted.to(device)
+        mask = mask.to(device)
+        shape = corrupted.shape
+        B = shape[0]
+
+        ts = torch.linspace(1.0, eps, num_steps + 1, device=device)
+        x = torch.randn(shape, device=device) * self.sigma(ts[:1])
+        x_mean = x
+        for i in range(num_steps):
+            t = torch.full((B,), ts[i], device=device)
+            dt = ts[i] - ts[i + 1]
+            beta_t = _broadcast(self.beta(t), x)
+            g_t = _broadcast(self.diffusion(t), x)
+            score = score_model(x, t)
+            x_mean = x + (0.5 * beta_t * x + beta_t * score) * dt
+            x = x_mean + g_t * torch.sqrt(dt) * torch.randn_like(x)
+
+            # Condition on observations: overwrite known pixels with the
+            # ground truth diffused forward to the *next* (lower) noise level.
+            t_next = torch.full((B,), ts[i + 1], device=device)
+            c_next = _broadcast(self.c(t_next), x)
+            sigma_next = _broadcast(self.sigma(t_next), x)
+            known = c_next * corrupted + sigma_next * torch.randn_like(corrupted)
+            x = mask * known + (1.0 - mask) * x
+            x_mean = mask * known + (1.0 - mask) * x_mean
+
+        return x_mean
