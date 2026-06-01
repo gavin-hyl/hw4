@@ -24,12 +24,6 @@
 
 #let oa = $overline(alpha)$
 
-#align(center)[
-  #text(size: 14pt)[*EE/CS 148B — Homework 4*] \
-  #text(size: 11pt)[Gavin Hua] \
-  #v(2pt)
-  Colab notebook: #link("https://colab.research.google.com/")[#emph[(paste your Colab share link here)]]
-]
 #v(6pt)
 
 = 1
